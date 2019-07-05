@@ -27,6 +27,8 @@ RCT_EXPORT_MODULE()
     return @[@"connect",
              @"connection",
              @"data",
+             @"progress",
+             @"header",
              @"close",
              @"error"];
 }
@@ -139,6 +141,19 @@ RCT_EXPORT_METHOD(listen:(nonnull NSNumber*)cId
 {
     NSString *base64String = [data base64EncodedStringWithOptions:0];
     [self sendEventWithName:@"data"
+                       body:@{ @"id": clientID, @"data" : base64String }];
+}
+
+- (void)onProgress:(NSNumber *)clientID didReceive:(int)received
+{
+    [self sendEventWithName:@"progress"
+                       body:@{ @"id": clientID, @"received" : @(received) }];
+}
+
+- (void)onHeader:(NSNumber *)clientID data:(NSData *)data
+{
+    NSString *base64String = [data base64EncodedStringWithOptions:0];
+    [self sendEventWithName:@"header"
                        body:@{ @"id": clientID, @"data" : base64String }];
 }
 

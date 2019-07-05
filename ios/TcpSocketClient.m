@@ -3,6 +3,7 @@
  * All rights reserved.
  */
 
+#include <Foundation/Foundation.h>
 #import <netinet/in.h>
 #import <arpa/inet.h>
 #import "TcpSocketClient.h"
@@ -15,8 +16,13 @@ NSString *const RCTTCPErrorDomain = @"RCTTCPErrorDomain";
 {
 @private
     GCDAsyncSocket *_tcpSocket;
+    NSString *_destination;
+    NSFileHandle *_fh;
+    int _received;
+    bool _gotHeader;
     NSMutableDictionary<NSNumber *, RCTResponseSenderBlock> *_pendingSends;
     NSLock *_lock;
+    NSDate *_lastProgress;
     long _sendTag;
 }
 
@@ -45,7 +51,11 @@ NSString *const RCTTCPErrorDomain = @"RCTTCPErrorDomain";
         _clientDelegate = aDelegate;
         _pendingSends = [NSMutableDictionary dictionary];
         _lock = [[NSLock alloc] init];
+        _received = 0;
+        _destination = nil;
+        _fh = nil;
         _tcpSocket = tcpSocket;
+        _lastProgress = nil;
         [_tcpSocket setUserData: clientID];
     }
 
@@ -67,8 +77,18 @@ NSString *const RCTTCPErrorDomain = @"RCTTCPErrorDomain";
 
     BOOL result = false;
 
-    NSString *localAddress = (options?options[@"localAddress"]:nil);
-    NSNumber *localPort = (options?options[@"localPort"]:nil);
+    NSString *localAddress = (options ? options[@"localAddress"] : nil);
+    NSNumber *localPort = (options ? options[@"localPort"] : nil);
+    NSString *destination = (options ? options[@"write"] : nil);
+
+    _destination = destination;
+    _received = 0;
+
+    RCTLogInfo(@"CONNECT");
+    RCTLogInfo(@"%@", options);
+    if (_destination != nil) {
+        RCTLogInfo(@"Dest: %s", _destination);
+    }
 
     if (!localAddress && !localPort) {
         result = [_tcpSocket connectToHost:host onPort:port error:error];
@@ -200,14 +220,88 @@ NSString *const RCTTCPErrorDomain = @"RCTTCPErrorDomain";
     [_tcpSocket disconnect];
 }
 
+- (UInt32)decode32FromBytes:(NSData *)data offset:(UInt32 *)offsetPointer {
+    UInt8 *octets = (UInt8 *)[data bytes];
+    UInt32 offset = *offsetPointer;
+    UInt32 result = 0;
+    int shift = 0;
+    while(YES) {
+        result += ((octets[offset] & 0x7F) << shift);
+        if (octets[offset] < 128) {
+            *offsetPointer = offset + 1;
+            return result;
+        }
+        offset++;
+        shift += 7;
+    }
+}
+
+- (bool)updateProgress {
+    NSDate *now = [NSDate date];
+    if (_lastProgress == nil) {
+        _lastProgress = now;
+        return true;
+    }
+    NSTimeInterval since = [now timeIntervalSinceDate: _lastProgress];
+    if (since > 1) {
+        _lastProgress = now;
+        return true;
+    }
+    return false;
+}
+
 - (void)socket:(GCDAsyncSocket *)sock didReadData:(NSData *)data withTag:(long)tag {
     if (!_clientDelegate) {
         RCTLogWarn(@"didReadData with nil clientDelegate for %@", [sock userData]);
         return;
     }
+    
+    if (_destination != nil) {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSData *wrote = data;
+        
+        if (!_gotHeader) {
+            UInt32 offset = 0;
+            UInt32 headerLength = [self decode32FromBytes:data offset:&offset];
 
-    [_clientDelegate onData:@(tag) data:data];
+            NSRange headerRange = { 0, offset + headerLength };
+            NSData *headerData = [data subdataWithRange:headerRange];
 
+            [_clientDelegate onHeader:@(tag) data:headerData];
+            
+            NSRange remaining = { offset + headerLength, [data length] - offset - headerLength };
+            wrote = [data subdataWithRange:remaining];
+
+            // RCTLogInfo(@"OK %d %d %d %d", headerLength, offset, [data length], [wrote length]);
+            
+            _gotHeader = true;
+        }
+        
+        if (_fh == nil)
+        {
+            BOOL success = [fm createFileAtPath:_destination contents:wrote attributes:nil];
+            if (!success) {
+                RCTLogWarn(@"Error creating file.");
+            }
+            _fh = [NSFileHandle fileHandleForUpdatingAtPath:_destination];
+            [_fh seekToEndOfFile];
+        }
+        else
+        {
+            [_fh writeData:wrote];
+        }
+        
+        _received += [wrote length];
+        
+        if ([self updateProgress]) {
+            RCTLogInfo(@"Progress %d", _received);
+            [_clientDelegate onProgress:@(tag) didReceive:_received];
+        }
+    }
+    else {
+        [_clientDelegate onData:@(tag) data:data];
+    }
+    
     [sock readDataWithTimeout:-1 tag:tag];
 }
 
