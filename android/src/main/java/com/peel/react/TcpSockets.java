@@ -7,6 +7,7 @@ package com.peel.react;
 
 import android.support.annotation.Nullable;
 import android.util.Base64;
+import android.net.Uri;
 
 import com.facebook.common.logging.FLog;
 import com.facebook.react.bridge.Arguments;
@@ -20,12 +21,17 @@ import com.facebook.react.bridge.ReadableMap;
 import com.facebook.react.bridge.WritableMap;
 import com.facebook.react.modules.core.DeviceEventManagerModule;
 
+import java.io.File;
+import java.io.OutputStream;
 import java.io.IOException;
+import java.io.FileNotFoundException;
+
 import java.net.InetAddress;
 import java.net.Inet6Address;
 import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
 import java.util.concurrent.ExecutionException;
+import java.util.Arrays;
 
 /**
  * The NativeModule acting as an api layer for {@link TcpSocketManager}
@@ -92,10 +98,10 @@ public final class TcpSockets extends ReactContextBaseJavaModule implements TcpS
                     socketManager.listen(cId, host, port);
                 } catch (UnknownHostException uhe) {
                     FLog.e(TAG, "listen", uhe);
-                    onError(cId, uhe.getMessage());
+                    onError(cId, uhe.getMessage(), new SocketSettings());
                 } catch (IOException ioe) {
                     FLog.e(TAG, "listen", ioe);
-                    onError(cId, ioe.getMessage());
+                    onError(cId, ioe.getMessage(), new SocketSettings());
                 }
             }
         }.execute();
@@ -106,15 +112,17 @@ public final class TcpSockets extends ReactContextBaseJavaModule implements TcpS
         new GuardedAsyncTask<Void, Void>(getReactApplicationContext()) {
             @Override
             protected void doInBackgroundGuarded(Void... params) {
-                // NOTE : ignoring options for now, just use the available interface.
+                FLog.w(TAG, "options: " + options);
+                String destination = options.getString("write");
+                SocketSettings settings = new SocketSettings(destination );
                 try {
-                    socketManager.connect(cId, host, port);
+                    socketManager.connect(cId, host, port, settings);
                 } catch (UnknownHostException uhe) {
                     FLog.e(TAG, "connect", uhe);
-                    onError(cId, uhe.getMessage());
+                    onError(cId, uhe.getMessage(), settings);
                 } catch (IOException ioe) {
                     FLog.e(TAG, "connect", ioe);
-                    onError(cId, ioe.getMessage());
+                    onError(cId, ioe.getMessage(), settings);
                 }
             }
         }.execute();
@@ -151,7 +159,7 @@ public final class TcpSockets extends ReactContextBaseJavaModule implements TcpS
     /** TcpSocketListener */
 
     @Override
-    public void onConnection(Integer serverId, Integer clientId, InetSocketAddress socketAddress) {
+    public void onConnection(Integer serverId, Integer clientId, InetSocketAddress socketAddress, SocketSettings settings) {
         if (mShuttingDown) {
             return;
         }
@@ -175,7 +183,7 @@ public final class TcpSockets extends ReactContextBaseJavaModule implements TcpS
     }
 
     @Override
-    public void onConnect(Integer id, InetSocketAddress socketAddress) {
+    public void onConnect(Integer id, InetSocketAddress socketAddress, SocketSettings settings) {
         if (mShuttingDown) {
             return;
         }
@@ -194,25 +202,106 @@ public final class TcpSockets extends ReactContextBaseJavaModule implements TcpS
         sendEvent("connect", eventParams);
     }
 
-    @Override
-    public void onData(Integer id, byte[] data) {
-        if (mShuttingDown) {
-            return;
+    private Uri getFileUriIfFile(String filepath) throws IOException {
+        Uri uri = Uri.parse(filepath);
+        if (uri.getScheme() == null) {
+            // No prefix, assuming that provided path is absolute path to file
+            File file = new File(filepath);
+            if (file.isDirectory()) {
+                return null;
+            }
+            uri = Uri.parse("file://" + filepath);
         }
-        WritableMap eventParams = Arguments.createMap();
-        eventParams.putInt("id", id);
-        eventParams.putString("data", Base64.encodeToString(data, Base64.NO_WRAP));
+        return uri;
+    }
 
-        sendEvent("data", eventParams);
+    private Uri getFileUri(String filepath) throws IOException {
+        Uri uri = getFileUriIfFile(filepath);
+        if (uri == null) {
+            throw new IOException("EISDIR: illegal operation on a directory, read '" + filepath + "'");
+        }
+        return uri;
+    }
+
+    private OutputStream getOutputStream(String filepath, boolean append) throws IOException {
+        Uri uri = getFileUri(filepath);
+        OutputStream stream;
+        try {
+            stream = mReactContext.getContentResolver().openOutputStream(uri, append ? "wa" : "w");
+        } catch (FileNotFoundException ex) {
+            throw new IOException("ENOENT: no such file or directory, open '" + filepath + "'");
+        }
+        if (stream == null) {
+            throw new IOException("ENOENT: could not open an output stream for '" + filepath + "'");
+        }
+        return stream;
     }
 
     @Override
-    public void onClose(Integer id, String error) {
+    public void onData(Integer id, byte[] data, SocketSettings settings) {
+        if (mShuttingDown) {
+            return;
+        }
+
+        if (settings.getDestination() == null) {
+            WritableMap eventParams = Arguments.createMap();
+            eventParams.putInt("id", id);
+            eventParams.putString("data", Base64.encodeToString(data, Base64.NO_WRAP));
+
+            sendEvent("data", eventParams);
+        }
+        else {
+            try {
+                if (settings.getStream() == null) {
+                    settings.setStream(getOutputStream(settings.getDestination(), false));
+                }
+
+                if (!settings.gotHeader()) {
+                    FLog.w(TAG, "Header! " + data.length);
+
+                    int length[] = new int[1];
+                    int offset = Varint.getVarInt(data, 0, length);
+
+                    offset += length[0];
+
+                    settings.getStream().write(data, offset, data.length - offset);
+                    settings.received(data.length - offset);
+
+                    byte[] header = Arrays.copyOfRange(data, 0, offset);
+                    WritableMap eventParams = Arguments.createMap();
+                    eventParams.putInt("id", id);
+                    eventParams.putString("data", Base64.encodeToString(header, Base64.NO_WRAP));
+                    sendEvent("header", eventParams);
+
+                    settings.gotHeader(true);
+                }
+                else {
+                    settings.getStream().write(data);
+                    settings.received(data.length);
+                }
+
+                if (settings.updateProgress()) {
+                    WritableMap eventParams = Arguments.createMap();
+                    eventParams.putInt("id", id);
+                    eventParams.putInt("total", settings.getTotal());
+                    eventParams.putInt("received", settings.getReceived());
+                    sendEvent("progress", eventParams);
+                }
+            }
+            catch (IOException e) {
+                FLog.e(TAG, "Error writing data", e);
+                onError(id, e.getMessage(), settings);
+            }
+        }
+    }
+
+    @Override
+    public void onClose(Integer id, String error, SocketSettings settings) {
         if (mShuttingDown) {
             return;
         }
         if (error != null) {
-            onError(id, error);
+            onError(id, error, settings);
         }
 
         WritableMap eventParams = Arguments.createMap();
@@ -223,7 +312,7 @@ public final class TcpSockets extends ReactContextBaseJavaModule implements TcpS
     }
 
     @Override
-    public void onError(Integer id, String error) {
+    public void onError(Integer id, String error, SocketSettings settings) {
         if (mShuttingDown) {
             return;
         }

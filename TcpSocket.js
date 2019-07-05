@@ -261,6 +261,18 @@ TcpSocket.prototype._registerEvents = function(): void {
       }
       this._onConnection(ev.info);
     }),
+    this._eventEmitter.addListener('progress', ev => {
+      if (this._id !== ev.id) {
+        return;
+      }
+      this._onProgress(ev);
+    }),
+    this._eventEmitter.addListener('header', ev => {
+      if (this._id !== ev.id) {
+        return;
+      }
+      this._onHeader(ev.data);
+    }),
     this._eventEmitter.addListener('data', ev => {
       if (this._id !== ev.id) {
         return;
@@ -305,6 +317,14 @@ TcpSocket.prototype._onConnection = function(info: { id: number, address: { port
   setConnected(socket, info.address);
   this.emit('connection', socket);
 };
+
+TcpSocket.prototype._onProgress = function(info): void {
+    this.emit('progress', info);
+}
+
+TcpSocket.prototype._onHeader = function(data): void {
+    this.emit('header', new Buffer(data, 'base64'));
+}
 
 TcpSocket.prototype._onData = function(data: string): void {
   this._debug('received', 'data');
