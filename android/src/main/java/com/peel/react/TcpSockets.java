@@ -113,8 +113,11 @@ public final class TcpSockets extends ReactContextBaseJavaModule implements TcpS
             @Override
             protected void doInBackgroundGuarded(Void... params) {
                 FLog.w(TAG, "options: " + options);
-                String destination = options.getString("write");
-                SocketSettings settings = new SocketSettings(destination );
+		String destination = null;
+		if (options.hasKey("write")) {
+                    destination = options.getString("write");
+		}
+                SocketSettings settings = new SocketSettings(destination);
                 try {
                     socketManager.connect(cId, host, port, settings);
                 } catch (UnknownHostException uhe) {
